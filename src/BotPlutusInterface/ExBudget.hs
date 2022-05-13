@@ -131,8 +131,12 @@ mkBudgetMaps exUnitsMap txBody = do
 
   -- perform lookups in `insIx` and `policiesIx` to map
   -- `TxOutRef`'s and `MintingPolicyHash`'es to corresponding `ExBudget`s
-  mconcat <$> mapM (f insIx policiesIx) exUnits
+  mconcat <$> mapM (f insIx policiesIx . (scaleExUnits <$>)) exUnits
   where
+    scaleExUnits :: CAPI.ExecutionUnits -> CAPI.ExecutionUnits
+    scaleExUnits (CAPI.ExecutionUnits x y) = CAPI.ExecutionUnits (scaleNat x) (scaleNat y)
+      where
+        scaleNat n = n + ((n * 20) `div` 100)
     mkInputsIndex =
       Map.fromList
         . zip [0 ..]
