@@ -17,14 +17,19 @@ module BotPlutusInterface.Effects (
   logToContract,
   readFileTextEnvelope,
   writeFileJSON,
+  writeFileRaw,
   writeFileTextEnvelope,
   callCommand,
   estimateBudget,
   saveBudget,
+  slotToPOSIXTime,
+  posixTimeToSlot,
+  convertTimeRangeToSlotRange,
 ) where
 
 import BotPlutusInterface.ChainIndex (handleChainIndexReq)
 import BotPlutusInterface.ExBudget qualified as ExBudget
+import BotPlutusInterface.TimeSlot qualified as TimeSlot
 import BotPlutusInterface.Types (
   BudgetEstimationError,
   CLILocation (..),
@@ -35,15 +40,17 @@ import BotPlutusInterface.Types (
   TxFile,
   addBudget,
  )
-import Cardano.Api (AsType, FileError, HasTextEnvelope, TextEnvelopeDescr, TextEnvelopeError)
+import Cardano.Api (AsType, FileError (FileIOError), HasTextEnvelope, TextEnvelopeDescr, TextEnvelopeError)
 import Cardano.Api qualified
 import Control.Concurrent qualified as Concurrent
 import Control.Concurrent.STM (atomically, modifyTVar, modifyTVar')
 import Control.Monad (void, when)
 import Control.Monad.Freer (Eff, LastMember, Member, interpretM, send, type (~>))
+import Control.Monad.Trans.Except.Extra (handleIOExceptT, runExceptT)
 import Data.Aeson (ToJSON)
 import Data.Aeson qualified as JSON
 import Data.Bifunctor (second)
+import Data.ByteString qualified as ByteString
 import Data.Kind (Type)
 import Data.Maybe (catMaybes)
 import Data.String (IsString, fromString)
@@ -52,6 +59,7 @@ import Data.Text qualified as Text
 import Ledger qualified
 import Plutus.Contract.Effects (ChainIndexQuery, ChainIndexResponse)
 import Plutus.PAB.Core.ContractInstance.STM (Activity)
+import PlutusTx.Builtins.Internal (BuiltinByteString (BuiltinByteString), error)
 import System.Directory qualified as Directory
 import System.Exit (ExitCode (ExitFailure, ExitSuccess))
 import System.Process (readProcess, readProcessWithExitCode)
@@ -81,6 +89,7 @@ data PABEffect (w :: Type) (r :: Type) where
     FilePath ->
     PABEffect w (Either (FileError TextEnvelopeError) a)
   WriteFileJSON :: FilePath -> JSON.Value -> PABEffect w (Either (FileError ()) ())
+  WriteFileRaw :: FilePath -> BuiltinByteString -> PABEffect w (Either (FileError ()) ())
   WriteFileTextEnvelope ::
     HasTextEnvelope a =>
     FilePath ->
@@ -92,6 +101,14 @@ data PABEffect (w :: Type) (r :: Type) where
   QueryChainIndex :: ChainIndexQuery -> PABEffect w ChainIndexResponse
   EstimateBudget :: TxFile -> PABEffect w (Either BudgetEstimationError TxBudget)
   SaveBudget :: Ledger.TxId -> TxBudget -> PABEffect w ()
+  SlotToPOSIXTime ::
+    TimeSlot.ToWhichSlotTime ->
+    Ledger.Slot ->
+    PABEffect w (Either TimeSlot.TimeSlotConversionError Ledger.POSIXTime)
+  POSIXTimeToSlot :: Ledger.POSIXTime -> PABEffect w (Either TimeSlot.TimeSlotConversionError Ledger.Slot)
+  POSIXTimeRangeToSlotRange ::
+    Ledger.POSIXTimeRange ->
+    PABEffect w (Either TimeSlot.TimeSlotConversionError Ledger.SlotRange)
 
 handlePABEffect ::
   forall (w :: Type) (effs :: [Type -> Type]).
@@ -124,6 +141,10 @@ handlePABEffect contractEnv =
         ThreadDelay microSeconds -> Concurrent.threadDelay microSeconds
         ReadFileTextEnvelope asType filepath -> Cardano.Api.readFileTextEnvelope asType filepath
         WriteFileJSON filepath value -> Cardano.Api.writeFileJSON filepath value
+        WriteFileRaw filepath (BuiltinByteString value) ->
+          runExceptT $
+            handleIOExceptT (FileIOError filepath) $
+              ByteString.writeFile filepath value
         WriteFileTextEnvelope filepath envelopeDescr contents ->
           Cardano.Api.writeFileTextEnvelope filepath envelopeDescr contents
         ListDirectory filepath -> Directory.listDirectory filepath
@@ -137,6 +158,12 @@ handlePABEffect contractEnv =
         EstimateBudget txPath ->
           ExBudget.estimateBudget contractEnv.cePABConfig txPath
         SaveBudget txId exBudget -> saveBudgetImpl contractEnv txId exBudget
+        SlotToPOSIXTime toWhichTime slot ->
+          TimeSlot.slotToPOSIXTimeImpl contractEnv.cePABConfig toWhichTime slot
+        POSIXTimeToSlot pTime ->
+          TimeSlot.posixTimeToSlotImpl contractEnv.cePABConfig pTime
+        POSIXTimeRangeToSlotRange pTimeRange ->
+          TimeSlot.posixTimeRangeToContainedSlotRangeImpl contractEnv.cePABConfig pTimeRange
     )
 
 printLog' :: LogLevel -> LogLevel -> String -> IO ()
@@ -250,6 +277,14 @@ writeFileJSON ::
   Eff effs (Either (FileError ()) ())
 writeFileJSON path val = send @(PABEffect w) $ WriteFileJSON path val
 
+writeFileRaw ::
+  forall (w :: Type) (effs :: [Type -> Type]).
+  Member (PABEffect w) effs =>
+  FilePath ->
+  BuiltinByteString ->
+  Eff effs (Either (FileError ()) ())
+writeFileRaw path val = send @(PABEffect w) $ WriteFileRaw path val
+
 writeFileTextEnvelope ::
   forall (w :: Type) (a :: Type) (effs :: [Type -> Type]).
   Member (PABEffect w) effs =>
@@ -285,3 +320,25 @@ saveBudget ::
   TxBudget ->
   Eff effs ()
 saveBudget txId budget = send @(PABEffect w) $ SaveBudget txId budget
+
+slotToPOSIXTime ::
+  forall (w :: Type) (effs :: [Type -> Type]).
+  Member (PABEffect w) effs =>
+  TimeSlot.ToWhichSlotTime ->
+  Ledger.Slot ->
+  Eff effs (Either TimeSlot.TimeSlotConversionError Ledger.POSIXTime)
+slotToPOSIXTime tw s = send @(PABEffect w) (SlotToPOSIXTime tw s)
+
+posixTimeToSlot ::
+  forall (w :: Type) (effs :: [Type -> Type]).
+  Member (PABEffect w) effs =>
+  Ledger.POSIXTime ->
+  Eff effs (Either TimeSlot.TimeSlotConversionError Ledger.Slot)
+posixTimeToSlot = send @(PABEffect w) . POSIXTimeToSlot
+
+convertTimeRangeToSlotRange ::
+  forall (w :: Type) (effs :: [Type -> Type]).
+  Member (PABEffect w) effs =>
+  Ledger.POSIXTimeRange ->
+  Eff effs (Either TimeSlot.TimeSlotConversionError Ledger.SlotRange)
+convertTimeRangeToSlotRange = send @(PABEffect w) . POSIXTimeRangeToSlotRange

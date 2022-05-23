@@ -10,19 +10,23 @@ import BotPlutusInterface.Effects (
   PABEffect,
   ShellArgs (..),
   callCommand,
+  convertTimeRangeToSlotRange,
   createDirectoryIfMissing,
   estimateBudget,
   handlePABEffect,
   logToContract,
+  posixTimeToSlot,
   printLog,
   queryChainIndex,
   readFileTextEnvelope,
   saveBudget,
+  slotToPOSIXTime,
   threadDelay,
   uploadDir,
  )
 import BotPlutusInterface.Files (DummyPrivKey (FromSKey, FromVKey))
 import BotPlutusInterface.Files qualified as Files
+import BotPlutusInterface.TimeSlot (ToWhichSlotTime (ToEndTime), stackExchangeConvert)
 import BotPlutusInterface.Types (
   ContractEnvironment (..),
   LogLevel (Debug, Warn),
@@ -47,12 +51,13 @@ import Data.Map qualified as Map
 import Data.Row (Row)
 import Data.Text (Text)
 import Data.Text qualified as Text
+import Debug.Trace (traceM)
 import Ledger (POSIXTime)
 import Ledger qualified
 import Ledger.Address (PaymentPubKeyHash (PaymentPubKeyHash))
 import Ledger.Constraints.OffChain (UnbalancedTx (..))
 import Ledger.Slot (Slot (Slot))
-import Ledger.TimeSlot (posixTimeRangeToContainedSlotRange, posixTimeToEnclosingSlot, slotToEndPOSIXTime)
+import Ledger.TimeSlot (SlotConversionError, posixTimeToEnclosingSlot, slotToEndPOSIXTime)
 import Ledger.Tx (CardanoTx)
 import Ledger.Tx qualified as Tx
 import Plutus.ChainIndex.TxIdState (fromTx, transactionStatus)
@@ -160,10 +165,13 @@ handlePABReq contractEnv req = do
     CurrentSlotReq -> CurrentSlotResp <$> currentSlot @w contractEnv
     CurrentTimeReq -> CurrentTimeResp <$> currentTime @w contractEnv
     PosixTimeRangeToContainedSlotRangeReq posixTimeRange ->
-      pure $
-        PosixTimeRangeToContainedSlotRangeResp $
-          Right $
-            posixTimeRangeToContainedSlotRange contractEnv.cePABConfig.pcSlotConfig posixTimeRange
+      PosixTimeRangeToContainedSlotRangeResp
+        <$> posixTimeRangeToContainedSlotRange_ @w posixTimeRange
+    -- PosixTimeRangeToContainedSlotRangeReq posixTimeRange ->
+    --   pure $
+    --     PosixTimeRangeToContainedSlotRangeResp $
+    --       Right $
+    --         posixTimeRangeToContainedSlotRange contractEnv.cePABConfig.pcSlotConfig posixTimeRange
     AwaitTxStatusChangeReq txId -> AwaitTxStatusChangeResp txId <$> awaitTxStatusChange @w contractEnv txId
     ------------------------
     -- Unhandled requests --
@@ -353,10 +361,28 @@ awaitTime ::
   ContractEnvironment w ->
   POSIXTime ->
   Eff effs POSIXTime
-awaitTime ce = fmap fromSlot . awaitSlot ce . toSlot
+awaitTime ce pTime = do
+  startingTip <- CardanoCLI.queryTip @w ce.cePABConfig
+  traceM $ "Starting tip: " ++ show startingTip
+
+  slotFromTime <- posixTimeToSlot @w pTime >>= either (error . show) return
+  traceM $ "Converting " ++ show pTime ++ " to slot:"
+  traceM $ "- with node queries: " ++ show slotFromTime
+  traceM $ "- with stack exchng: " ++ show (stackExchangeConvert pTime)
+  traceM $ "- with ledger stuff: " ++ show oldSlotFromTime
+  slot' <- awaitSlot ce slotFromTime
+  traceM $ "Converting " ++ show slot' ++ " to time:"
+  ethTime <- slotToPOSIXTime @w ToEndTime slot'
+  time' <- either (error . show) return ethTime
+  traceM $ "- with node queries: " ++ show time'
+  traceM $ "- with ledger stuff: " ++ show (oldTimeFromSlot slot')
+
+  endTip <- CardanoCLI.queryTip @w ce.cePABConfig
+  traceM $ "Current tip: " ++ show endTip
+  return time'
   where
-    toSlot = posixTimeToEnclosingSlot ce.cePABConfig.pcSlotConfig
-    fromSlot = slotToEndPOSIXTime ce.cePABConfig.pcSlotConfig
+    oldSlotFromTime = posixTimeToEnclosingSlot ce.cePABConfig.pcSlotConfig pTime
+    oldTimeFromSlot = slotToEndPOSIXTime ce.cePABConfig.pcSlotConfig
 
 currentSlot ::
   forall (w :: Type) (effs :: [Type -> Type]).
@@ -380,4 +406,15 @@ currentTime ::
   ContractEnvironment w ->
   Eff effs POSIXTime
 currentTime contractEnv =
-  slotToEndPOSIXTime contractEnv.cePABConfig.pcSlotConfig <$> currentSlot @w contractEnv
+  currentSlot @w contractEnv
+    >>= slotToPOSIXTime @w ToEndTime
+    >>= either (error . show) return
+
+posixTimeRangeToContainedSlotRange_ ::
+  forall (w :: Type) (effs :: [Type -> Type]).
+  Member (PABEffect w) effs =>
+  Ledger.POSIXTimeRange ->
+  Eff effs (Either SlotConversionError Ledger.SlotRange)
+posixTimeRangeToContainedSlotRange_ posixTimeRange =
+  convertTimeRangeToSlotRange @w posixTimeRange
+    >>= either (error . show) (return . Right)
