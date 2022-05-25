@@ -193,17 +193,8 @@ awaitTxStatusChange contractEnv txId = do
   case mTx of
     Nothing -> pure Unknown
     Just txState -> do
-      printLog @w Debug $ "Found transaction in node, waiting " ++ show chainConstant ++ " blocks for it to settle."
-      awaitNBlocks @w contractEnv (chainConstant + 1)
-      -- Check if the tx is still present in chain-index, in case of a rollback
-      -- we might not find it anymore.
-      ciTxState' <- queryChainIndexForTxState
-      case ciTxState' of
-        Nothing -> pure Unknown
-        Just _ -> do
           blk <- fromInteger <$> currentBlock contractEnv
           -- This will set the validity correctly based on the txState.
-          -- The tx will always be committed, as we wait for chainConstant + 1 blocks
           let status = transactionStatus blk txState txId
           pure $ fromRight Unknown status
   where
